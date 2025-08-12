@@ -1,0 +1,145 @@
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+from sklearn.utils import check_random_state
+
+
+class VIFSelector(BaseEstimator, TransformerMixin):
+    """
+    Drop features with high multicollinearity using Variance Inflation Factor (VIF).
+
+    Parameters
+    ----------
+    thresh : float, default=5.0
+        Features whose (mean) VIF exceeds this threshold are iteratively removed.
+    max_iter : int, default=10
+        Maximum number of VIF–pruning rounds.
+    max_sample_features : int or None, default=None
+        Size of random column subset used for each VIF computation.
+        • None  -> use all remaining columns (classic VIF).\n
+        • <=1   -> raises ValueError.\n
+        • >= n_features_current -> same as None (all columns).
+    resample_columns : int, default=1
+        Number of independent sub‑samples drawn *per feature*.
+        Ignored when `max_sample_features is None`.
+    random_state : int or None, default=None
+        Controls the sub‑sampling reproducibility.
+    verbose : bool, default=False
+        If True, prints progress information.
+    """
+
+    def __init__(
+        self,
+        thresh=5.0,
+        max_iter=10,
+        max_sample_features=None,
+        resample_columns=1,
+        random_state=None,
+        verbose=False,
+    ):
+        self.thresh = thresh
+        self.max_iter = max_iter
+        self.max_sample_features = max_sample_features
+        self.resample_columns = resample_columns
+        self.random_state = random_state
+        self.verbose = verbose
+
+    # --------------------------------------------------------------------- #
+    #                          Private helpers                              #
+    # --------------------------------------------------------------------- #
+    def _compute_vifs_full(self, X):
+        """Classic all‑columns VIF."""
+        return pd.Series(
+            [variance_inflation_factor(X.values, i) for i in range(X.shape[1])],
+            index=X.columns,
+        )
+
+    def _compute_vifs_sampled(self, X, rng):
+        """
+        Compute *mean* VIF for each column using sub‑sampling.
+
+        For every column i:
+          – Draw `resample_columns` subsets of size `max_sample_features`
+            (always containing i).
+          – Compute VIF of i within each subset.
+          – Return the average.
+        """
+        cols = list(X.columns)
+        n_features = len(cols)
+        m = self.max_sample_features
+
+        if m is None or m >= n_features:
+            return self._compute_vifs_full(X)
+
+        if m <= 1:
+            raise ValueError("`max_sample_features` must be > 1 or None.")
+
+        vif_means = {}
+        for col in cols:
+            vifs = []
+            others = [c for c in cols if c != col]
+            k = min(m - 1, len(others))
+
+            for _ in range(self.resample_columns):
+                subset = [col] + rng.choice(others, size=k, replace=False).tolist()
+                X_sub = X[subset]
+                # Feature-of-interest is first column → index 0
+                vif_val = variance_inflation_factor(X_sub.values, 0)
+                vifs.append(vif_val)
+
+            vif_means[col] = np.mean(vifs)
+
+        return pd.Series(vif_means)
+
+    # --------------------------------------------------------------------- #
+    #                          Core estimator API                           #
+    # --------------------------------------------------------------------- #
+    def fit(self, X, y=None):
+        # --- Data checks -------------------------------------------------- #
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        X_work = X.copy()
+        self.features_in_ = list(X_work.columns)
+        self.features_to_drop_ = []
+        rng = check_random_state(self.random_state)
+
+        # --- Iterative pruning ------------------------------------------- #
+        for iteration in range(self.max_iter):
+            if self.max_sample_features is None:
+                vif_series = self._compute_vifs_full(X_work)
+            else:
+                vif_series = self._compute_vifs_sampled(X_work, rng)
+
+            max_vif = vif_series.max()
+            if self.verbose:
+                print(f"[Iter {iteration+1}] max VIF={max_vif:.3f}")
+                print(vif_series.sort_values(ascending=False).head())
+
+            if max_vif <= self.thresh:
+                break  # All remaining features are acceptable
+
+            drop_col = vif_series.idxmax()
+            if self.verbose:
+                print(f"Dropping '{drop_col}' (VIF={max_vif:.3f})\n")
+            self.features_to_drop_.append(drop_col)
+            X_work = X_work.drop(columns=[drop_col])
+
+        self.features_to_keep_ = [c for c in self.features_in_ if c not in self.features_to_drop_]
+        return self
+
+    def transform(self, X):
+        """Return X with the selected (low‑VIF) columns."""
+        if not hasattr(self, "features_to_keep_"):
+            raise RuntimeError("The selector is not fitted yet. Call 'fit' first.")
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X)
+        return X[self.features_to_keep_]
+
+    # scikit‑learn compatibility helpers ---------------------------------- #
+    def get_support(self):
+        """Boolean mask: True for retained columns."""
+        return np.array([c in self.features_to_keep_ for c in self.features_in_])
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(self.features_to_keep_)
